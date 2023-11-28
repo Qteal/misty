@@ -250,6 +250,7 @@ void *transmit_thread(void *ptr)
     unsigned char dest;
     thread_args_t *targ;
     port_info_t *port_info_ptr;
+    int was_in_use = 0;
 
     targ = (thread_args_t *)ptr;
     port_info_ptr = &port_info_array[targ->port_index];
@@ -258,10 +259,14 @@ void *transmit_thread(void *ptr)
             targ->port_index);
 
     while (1) {
+        was_in_use |= port_info_ptr->in_use;
         len = sizeof(struct sockaddr_un);
 
         numbytes = recvfrom(port_info_ptr->server_info.fd, buf, sizeof(buf), 0,
                             (struct sockaddr *) &recv_addr, &len);
+
+        if (port_info_ptr->in_use == 0 && was_in_use == 1)
+            break;
 
         if (numbytes < 0) {
             perror("recvfrom failed");
@@ -291,6 +296,7 @@ void *transmit_thread(void *ptr)
 
 
     }
+    log_printf("Transmit Thread exited for %s\n", port_info_ptr->path);
 
     return (NULL);
 
@@ -362,6 +368,8 @@ void cleanup()
     for (int i=0; i<g_port_index; i++)
     {
         port_info_ptr = &port_info_array[i];
+        port_info_ptr->in_use = 0;
+        shutdown(port_info_ptr->server_info.fd, SHUT_RD);
         dlmstp_cleanup(&port_info_ptr->mstp_port);
     }
 }

@@ -124,6 +124,7 @@ void dlmstp_cleanup(
     tcsetattr(poSharedData->RS485_Handle, TCSANOW,
         &poSharedData->RS485_oldtio);
     close(poSharedData->RS485_Handle);
+    poSharedData->RS485_Handle = -1;
 
     pthread_cond_destroy(&poSharedData->Received_Frame_Flag);
 #ifdef __APPLE__
@@ -286,7 +287,7 @@ void *dlmstp_master_fsm_task(
         return NULL;
     }
 
-    for (;;) {
+    while (poSharedData->RS485_Handle != -1) {
         if (mstp_port->ReceivedValidFrame == false &&
             mstp_port->ReceivedInvalidFrame == false) {
             RS485_Check_UART_Data(mstp_port);
