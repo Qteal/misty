@@ -7,7 +7,10 @@ import sys
 import subprocess
 
 from setuptools import setup
-from wheel.bdist_wheel import bdist_wheel
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+except:
+    from wheel.bdist_wheel import bdist_wheel
 
 
 class BinaryDistWheel(bdist_wheel):
