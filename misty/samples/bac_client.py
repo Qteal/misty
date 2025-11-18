@@ -22,7 +22,8 @@ from bacpypes.iocb import IOCB
 
 from bacpypes.pdu import Address, GlobalBroadcast
 from bacpypes.apdu import SimpleAckPDU
-from bacpypes.apdu import ReadPropertyRequest, ReadPropertyACK, WritePropertyRequest
+from bacpypes.apdu import ReadPropertyRequest, ReadPropertyACK, WritePropertyRequest, \
+    SubscribeCOVRequest, ConfirmedCOVNotificationRequest, UnconfirmedCOVNotificationRequest
 from bacpypes.primitivedata import Unsigned, ObjectIdentifier
 from bacpypes.object import get_datatype
 from bacpypes.constructeddata import Array
@@ -58,6 +59,8 @@ class WhoIsIAmApplication(MSTPSimpleApplication):
 
         # keep track of requests to line up responses
         self._request = None
+        self._next_subscriber_id = 1
+        self._subscriptions = {}
 
     def request(self, apdu):
         if _debug: WhoIsIAmApplication._debug("request %r", apdu)
@@ -77,7 +80,10 @@ class WhoIsIAmApplication(MSTPSimpleApplication):
     def indication(self, apdu):
         if _debug: WhoIsIAmApplication._debug("indication %r", apdu)
 
-        if (isinstance(apdu, IAmRequest)):
+        if isinstance(apdu, (ConfirmedCOVNotificationRequest, UnconfirmedCOVNotificationRequest)):
+            self._handle_cov_notification(apdu)
+
+        if isinstance(apdu, IAmRequest):
             device_type, device_instance = apdu.iAmDeviceIdentifier
             if device_type != 'device':
                 raise DecodingError("invalid object type")
@@ -92,6 +98,105 @@ class WhoIsIAmApplication(MSTPSimpleApplication):
 
         # forward it along
         MSTPSimpleApplication.indication(self, apdu)
+
+    def _handle_cov_notification(self, apdu):
+        """Decode and display incoming COV notifications."""
+        obj_type, obj_instance = apdu.monitoredObjectIdentifier
+        header = "COV notification from {} for {}:{} (process {}, timeRemaining={})".format(
+            apdu.pduSource,
+            obj_type,
+            obj_instance,
+            apdu.subscriberProcessIdentifier,
+            getattr(apdu, 'timeRemaining', None),
+        )
+        sys.stdout.write(header + '\n')
+
+        subscription = self._subscriptions.get(apdu.subscriberProcessIdentifier)
+        if subscription is not None:
+            subscription['timeRemaining'] = getattr(apdu, 'timeRemaining', None)
+
+        for cov_value in getattr(apdu, 'listOfValues', []) or []:
+            value = self._decode_cov_value(obj_type, cov_value)
+            suffix = ''
+            if getattr(cov_value, 'propertyArrayIndex', None) is not None:
+                suffix = "[{}]".format(cov_value.propertyArrayIndex)
+            sys.stdout.write("  {}{} = {}\n".format(
+                cov_value.propertyIdentifier,
+                suffix,
+                value,
+            ))
+        sys.stdout.flush()
+
+    def _decode_cov_value(self, obj_type, cov_value):
+        """Return the decoded Python value for a PropertyValue."""
+        datatype = get_datatype(obj_type, cov_value.propertyIdentifier)
+        candidate = cov_value.value
+
+        if not datatype:
+            return candidate
+
+        try:
+            if issubclass(datatype, Array) and (cov_value.propertyArrayIndex is not None):
+                if cov_value.propertyArrayIndex == 0:
+                    datatype = Unsigned
+                else:
+                    datatype = datatype.subtype
+            return candidate.cast_out(datatype)
+        except Exception as err:
+            if _debug:
+                WhoIsIAmApplication._debug("Error decoding COV value: %r", err)
+            try:
+                return candidate.cast_out(AnyAtomic)
+            except Exception:
+                return candidate
+
+    def _allocate_subscriber_id(self):
+        subscriber_id = self._next_subscriber_id
+        self._next_subscriber_id += 1
+        return subscriber_id
+
+    def subscribe_cov(self, destination, obj_id, lifetime=300, confirmed=False, subscriber_id=None):
+        """Send a SubscribeCOVRequest and return (subscriber_id, iocb)."""
+        if subscriber_id is None:
+            subscriber_id = self._allocate_subscriber_id()
+
+        request = SubscribeCOVRequest(
+            subscriberProcessIdentifier=subscriber_id,
+            monitoredObjectIdentifier=obj_id,
+            issueConfirmedNotifications=bool(confirmed),
+            lifetime=int(lifetime),
+        )
+        request.pduDestination = Address(destination)
+
+        iocb = IOCB(request)
+
+        def _complete_cov_request(iocb):
+            if _debug:
+                WhoIsIAmApplication._debug("subscribe_cov complete %r", iocb)
+            if iocb.ioResponse:
+                if lifetime == 0:
+                    self._subscriptions.pop(subscriber_id, None)
+                else:
+                    self._subscriptions[subscriber_id] = {
+                        'destination': request.pduDestination,
+                        'objectIdentifier': obj_id,
+                        'confirmed': bool(confirmed),
+                        'lifetime': int(lifetime),
+                    }
+            elif iocb.ioError and lifetime == 0:
+                self._subscriptions.pop(subscriber_id, None)
+
+        iocb.add_callback(_complete_cov_request)
+        self.request_io(iocb)
+        return subscriber_id, iocb
+
+    def cancel_cov(self, destination, obj_id, subscriber_id):
+        """Cancel an active COV subscription by re-sending with lifetime=0."""
+        return self.subscribe_cov(destination, obj_id, lifetime=0, confirmed=False, subscriber_id=subscriber_id)
+
+    def get_cov_subscriptions(self):
+        """Return a shallow copy of current COV subscriptions."""
+        return dict(self._subscriptions)
 
 #
 #   BacnetClientConsoleCmd
@@ -349,6 +454,91 @@ class BacnetClientConsoleCmd(ConsoleCmd):
 
         except Exception as error:
             BacnetClientConsoleCmd._exception("exception: %r", error)
+
+    def do_cov(self, args):
+        """cov <addr> <type>:<inst> [ <lifetime=300> ] [ <confirmed=0|1> ]"""
+        args = args.split()
+        if _debug:
+            BacnetClientConsoleCmd._debug("do_cov %r", args)
+
+        try:
+            if len(args) < 2:
+                raise ValueError("cov <addr> <type>:<inst> [<lifetime>] [<confirmed>]")
+
+            addr, obj_id = args[:2]
+            obj_id = ObjectIdentifier(obj_id).value
+            lifetime = int(args[2]) if len(args) >= 3 else 300
+            confirmed = bool(int(args[3])) if len(args) >= 4 else False
+
+            subscriber_id, iocb = this_application.subscribe_cov(
+                addr, obj_id, lifetime=lifetime, confirmed=confirmed
+            )
+            iocb.wait()
+
+            if iocb.ioResponse:
+                sys.stdout.write(
+                    "Subscribed to {}:{} (process id {})\n".format(
+                        obj_id[0], obj_id[1], subscriber_id
+                    )
+                )
+            elif iocb.ioError:
+                sys.stdout.write(str(iocb.ioError) + '\n')
+
+        except Exception as error:
+            BacnetClientConsoleCmd._exception("exception: %r", error)
+
+    def do_covcancel(self, args):
+        """covcancel <addr> <type>:<inst> <subscriber-id>"""
+        args = args.split()
+        if _debug:
+            BacnetClientConsoleCmd._debug("do_covcancel %r", args)
+
+        try:
+            if len(args) != 3:
+                raise ValueError("covcancel <addr> <type>:<inst> <subscriber-id>")
+
+            addr, obj_id, subscriber_id = args
+            obj_id = ObjectIdentifier(obj_id).value
+            subscriber_id = int(subscriber_id)
+
+            _, iocb = this_application.cancel_cov(addr, obj_id, subscriber_id)
+            iocb.wait()
+
+            if iocb.ioResponse:
+                sys.stdout.write(
+                    "Cancelled subscription {} for {}:{}\n".format(
+                        subscriber_id, obj_id[0], obj_id[1]
+                    )
+                )
+            elif iocb.ioError:
+                sys.stdout.write(str(iocb.ioError) + '\n')
+
+        except Exception as error:
+            BacnetClientConsoleCmd._exception("exception: %r", error)
+
+    def do_covlist(self, args):
+        """covlist"""
+        if _debug:
+            BacnetClientConsoleCmd._debug("do_covlist %r", args)
+
+        subs = this_application.get_cov_subscriptions()
+        if not subs:
+            sys.stdout.write("No active COV subscriptions\n")
+            return
+
+        for subscriber_id, info in sorted(subs.items()):
+            sys.stdout.write(
+                "id {} -> {} {}:{} confirmed={} lifetime={} timeRemaining={}\n".format(
+                    subscriber_id,
+                    info['destination'],
+                    info['objectIdentifier'][0],
+                    info['objectIdentifier'][1],
+                    info['confirmed'],
+                    info['lifetime'],
+                    info.get('timeRemaining'),
+                )
+            )
+        sys.stdout.flush()
 
     def do_mstpstat(self, args):
         """discover <addr> <device-id>"""

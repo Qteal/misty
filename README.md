@@ -151,6 +151,9 @@ The bacnet client program console offers commands to do basic BACnet commands li
 *  iam
 *  read
 *  write
+*  cov
+*  covcancel
+*  covlist
 * discover
 * mstpstat
 * mstpdbg
@@ -187,6 +190,13 @@ Now we can use any of the commands supported on the BACnet client console to sen
 *  discover
 *  read
 *  write
+*  cov
+*  covcancel
+*  covlist
+
+The `cov`/`covcancel` commands send SubscribeCOV requests (or cancellations) to
+remote devices, while `covlist` prints the currently tracked subscriptions and
+their remaining lifetimes.
 
 The following image shows a sample interaction between the BACnet Server, and BACnet client program running on the same machine using socat utility
 
