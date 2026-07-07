@@ -250,6 +250,16 @@ class BacnetClientApplication(MSTPSimpleApplication):
 ```
 
 The misty/samples directory contains some bacpypes IP applications ported to use the MSTP Network
+
+For software-in-the-loop testing, `interface` may also point to a TCP byte
+stream instead of a tty device:
+
+```ini
+interface:tcp://127.0.0.1:8080
+```
+
+This is intended for transports that carry raw BACnet MS/TP bytes without
+additional framing.
 - CommandableMixin
 - ReadProperty
 - ReadPropertyMultiple

@@ -71,6 +71,7 @@
 
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 
 #include "dlmstp_linux.h"
 
@@ -424,7 +425,7 @@ void RS485_Send_Frame(
         greska = errno;
         if (written <= 0) {
             printf("write error: %s\n", strerror(greska));
-        } else {
+        } else if (isatty(RS485_Handle)) {
             /* wait until all output has been transmitted. */
             int out;
             ioctl(RS485_Handle, TIOCOUTQ, &out);
@@ -457,13 +458,14 @@ void RS485_Send_Frame(
             printf("write error: %s\n", strerror(greska));
         } else {
             /* wait until all output has been transmitted. */
-
-            int out;
-            ioctl(poSharedData->RS485_Handle, TIOCOUTQ, &out);
-            if(out > 1024){
-                printf("Going into a Lock in tcdrain %d \n",out);
-                tcdrain(poSharedData->RS485_Handle);
-                printf("Came out of Lock in tcdrain\n");
+            if (isatty(poSharedData->RS485_Handle)) {
+                int out;
+                ioctl(poSharedData->RS485_Handle, TIOCOUTQ, &out);
+                if(out > 1024){
+                    printf("Going into a Lock in tcdrain %d \n",out);
+                    tcdrain(poSharedData->RS485_Handle);
+                    printf("Came out of Lock in tcdrain\n");
+                }
             }
             mstp_port->bytes_xmit += written;
         }
@@ -564,10 +566,12 @@ void RS485_Cleanup(
     void)
 {
     /* restore the old port settings */
-    tcsetattr(RS485_Handle, TCSANOW, &RS485_oldtio);
+    if (isatty(RS485_Handle)) {
+        tcsetattr(RS485_Handle, TCSANOW, &RS485_oldtio);
 #ifdef __linux__ 
-    ioctl(RS485_Handle, TIOCSSERIAL, &RS485_oldserial);
+        ioctl(RS485_Handle, TIOCSSERIAL, &RS485_oldserial);
 #endif
+    }
     close(RS485_Handle);
 }
 

@@ -28,7 +28,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
 #include "bacdef.h"
 #include "bacaddr.h"
 #include "mstp.h"
@@ -120,9 +125,11 @@ void dlmstp_cleanup(
         return;
     }
 
-    /* restore the old port settings */
-    tcsetattr(poSharedData->RS485_Handle, TCSANOW,
-        &poSharedData->RS485_oldtio);
+    if (isatty(poSharedData->RS485_Handle)) {
+        /* restore the old port settings */
+        tcsetattr(poSharedData->RS485_Handle, TCSANOW,
+            &poSharedData->RS485_oldtio);
+    }
     close(poSharedData->RS485_Handle);
     poSharedData->RS485_Handle = -1;
 
@@ -136,6 +143,73 @@ void dlmstp_cleanup(
     pthread_cond_destroy(&poSharedData->Master_Done_Flag);
     pthread_mutex_destroy(&poSharedData->Received_Frame_Mutex);
     pthread_mutex_destroy(&poSharedData->Master_Done_Mutex);
+}
+
+static bool dlmstp_is_tcp_uri(const char *ifname)
+{
+    return ifname && (strncmp(ifname, "tcp://", 6) == 0);
+}
+
+static int dlmstp_tcp_connect(const char *ifname)
+{
+    char endpoint[256];
+    char *host;
+    char *port;
+    char *colon;
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    struct addrinfo *rp;
+    int fd = -1;
+    int rc;
+    int one = 1;
+
+    if (!dlmstp_is_tcp_uri(ifname)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    strncpy(endpoint, ifname + 6, sizeof(endpoint) - 1);
+    endpoint[sizeof(endpoint) - 1] = '\0';
+    host = endpoint;
+    colon = strrchr(endpoint, ':');
+    if (colon == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *colon = '\0';
+    port = colon + 1;
+    if ((*host == '\0') || (*port == '\0')) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    rc = getaddrinfo(host, port, &hints, &result);
+    if (rc != 0) {
+        fprintf(stderr, "getaddrinfo(%s): %s\n", ifname, gai_strerror(rc));
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
+        }
+
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(result);
+    return fd;
 }
 
 /* returns number of bytes sent on success, zero on failure */
@@ -933,81 +1007,96 @@ bool dlmstp_init(
     }
 
     printf("RS485: Initializing %s", poSharedData->RS485_Port_Name);
-    /*
-       Open device for reading and writing.
-       Blocking mode - more CPU effecient
-     */
-    poSharedData->RS485_Handle =
-        open(poSharedData->RS485_Port_Name,
-        O_RDWR | O_NOCTTY | O_NONBLOCK /*| O_NDELAY */ );
-    if (poSharedData->RS485_Handle < 0) {
-        perror(poSharedData->RS485_Port_Name);
-        exit(-1);
-    }
+    if (dlmstp_is_tcp_uri(poSharedData->RS485_Port_Name)) {
+        poSharedData->RS485_Handle =
+            dlmstp_tcp_connect(poSharedData->RS485_Port_Name);
+        if (poSharedData->RS485_Handle < 0) {
+            perror(poSharedData->RS485_Port_Name);
+            exit(-1);
+        }
+    } else {
+        /*
+           Open device for reading and writing.
+           Blocking mode - more CPU effecient
+         */
+        poSharedData->RS485_Handle =
+            open(poSharedData->RS485_Port_Name,
+            O_RDWR | O_NOCTTY | O_NONBLOCK /*| O_NDELAY */ );
+        if (poSharedData->RS485_Handle < 0) {
+            perror(poSharedData->RS485_Port_Name);
+            exit(-1);
+        }
 #if 0
-    /* non blocking for the read */
-    fcntl(poSharedData->RS485_Handle, F_SETFL, FNDELAY);
+        /* non blocking for the read */
+        fcntl(poSharedData->RS485_Handle, F_SETFL, FNDELAY);
 #else
-    /* efficient blocking for the read */
-    fcntl(poSharedData->RS485_Handle, F_SETFL, 0);
+        /* efficient blocking for the read */
+        fcntl(poSharedData->RS485_Handle, F_SETFL, 0);
 #endif
+    }
 
 #ifdef __APPLE__
       struct termios options;
 
-      tcgetattr(poSharedData->RS485_Handle, &options);
-      cfsetispeed(&options,  poSharedData->RS485_Baud);
-      cfsetospeed(&options,  poSharedData->RS485_Baud);
+      if (isatty(poSharedData->RS485_Handle)) {
+          tcgetattr(poSharedData->RS485_Handle, &options);
+          cfsetispeed(&options,  poSharedData->RS485_Baud);
+          cfsetospeed(&options,  poSharedData->RS485_Baud);
 
-      //No parity 8N1
-      options.c_cflag &= ~PARENB;
-      options.c_cflag &= ~CSTOPB;
-      options.c_cflag &= ~CSIZE;
-      options.c_cflag |= CS8;
+          //No parity 8N1
+          options.c_cflag &= ~PARENB;
+          options.c_cflag &= ~CSTOPB;
+          options.c_cflag &= ~CSIZE;
+          options.c_cflag |= CS8;
 
-      //No flow control
-      options.c_cflag &= ~CRTSCTS;
+          //No flow control
+          options.c_cflag &= ~CRTSCTS;
 
-      //Turn off s/w flow control
-      options.c_iflag &= ~(IXON | IXOFF | IXANY);
+          //Turn off s/w flow control
+          options.c_iflag &= ~(IXON | IXOFF | IXANY);
 
-      //Turn on read and ignore ctrl lines
-      options.c_cflag |= (CLOCAL | CREAD);
+          //Turn on read and ignore ctrl lines
+          options.c_cflag |= (CLOCAL | CREAD);
 
-      if( tcsetattr(poSharedData->RS485_Handle, TCSANOW, &options) < 0) {
-        perror(poSharedData->RS485_Port_Name);
-        exit(-1);
+          if( tcsetattr(poSharedData->RS485_Handle, TCSANOW, &options) < 0) {
+            perror(poSharedData->RS485_Port_Name);
+            exit(-1);
+          }
       }
 #endif
 #ifdef __linux__ 
     struct termios newtio;
-    /* save current serial port settings */
-    tcgetattr(poSharedData->RS485_Handle, &poSharedData->RS485_oldtio);
-    /* clear struct for new port settings */
-    bzero(&newtio, sizeof(newtio));
-    /*
-       BAUDRATE: Set bps rate. You could also use cfsetispeed and cfsetospeed.
-       CRTSCTS : output hardware flow control (only used if the cable has
-       all necessary lines. See sect. 7 of Serial-HOWTO)
-       CLOCAL  : local connection, no modem contol
-       CREAD   : enable receiving characters
-     */
-    newtio.c_cflag =
-        poSharedData->RS485_Baud | poSharedData->RS485MOD | CLOCAL | CREAD;
-    /* Raw input */
-    newtio.c_iflag = 0;
-    /* Raw output */
-    newtio.c_oflag = 0;
-    /* no processing */
-    newtio.c_lflag = 0;
-    /* activate the settings for the port after flushing I/O */
-    tcsetattr(poSharedData->RS485_Handle, TCSAFLUSH, &newtio);
+    if (isatty(poSharedData->RS485_Handle)) {
+        /* save current serial port settings */
+        tcgetattr(poSharedData->RS485_Handle, &poSharedData->RS485_oldtio);
+        /* clear struct for new port settings */
+        bzero(&newtio, sizeof(newtio));
+        /*
+           BAUDRATE: Set bps rate. You could also use cfsetispeed and cfsetospeed.
+           CRTSCTS : output hardware flow control (only used if the cable has
+           all necessary lines. See sect. 7 of Serial-HOWTO)
+           CLOCAL  : local connection, no modem contol
+           CREAD   : enable receiving characters
+         */
+        newtio.c_cflag =
+            poSharedData->RS485_Baud | poSharedData->RS485MOD | CLOCAL | CREAD;
+        /* Raw input */
+        newtio.c_iflag = 0;
+        /* Raw output */
+        newtio.c_oflag = 0;
+        /* no processing */
+        newtio.c_lflag = 0;
+        /* activate the settings for the port after flushing I/O */
+        tcsetattr(poSharedData->RS485_Handle, TCSAFLUSH, &newtio);
+    }
 
 #endif
 
     /* flush any data waiting */
     usleep(200000);
-    tcflush(poSharedData->RS485_Handle, TCIOFLUSH);
+    if (isatty(poSharedData->RS485_Handle)) {
+        tcflush(poSharedData->RS485_Handle, TCIOFLUSH);
+    }
     /* ringbuffer */
     FIFO_Init(&poSharedData->Rx_FIFO, poSharedData->Rx_Buffer,
         sizeof(poSharedData->Rx_Buffer));
